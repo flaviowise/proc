@@ -1,0 +1,677 @@
+  
+CREATE PROCEDURE [dbo].[SPH1_ISS_POSINV]      
+(      
+  @DTREF_IN  DATETIME,      
+  @NRCTRL_IN  BIGINT,      
+  @CDUSR_IN  INT,      
+  @STA_OUT  INT OUTPUT,      
+  @MSGSTA_OUT VARCHAR(256) OUTPUT      
+)      
+AS      
+BEGIN      
+  
+ SET NOCOUNT ON     
+  
+ DECLARE      
+  @NMSP VARCHAR(30),      
+  @ROWC INT,      
+  @NMITF VARCHAR(200)  
+    
+ DECLARE  
+  @DTSIS  DATETIME,  
+  @DATA_ATUAL DATETIME,  
+  @DATA_EXGO DATETIME --DATA PARA EXPURGO  
+  
+ DECLARE      
+  @SQL  NVARCHAR(600),      
+  @THREAD  INT,  
+  @TOTREGDET  int  
+  
+ SELECT      
+  @NMSP  = 'SPH1_ISS_POSINV - ',      
+  @STA_OUT = 0,      
+  @MSGSTA_OUT = 'OK',      
+  @SQL  = '',  
+  @TOTREGDET  =  0  
+  
+ -- SELECIONA A DATA DO SISTEMA      
+ SELECT      
+  @DTSIS = TBSTA_DTSIS      
+ FROM      
+  TBH1STA2      
+  
+ -- SELECIONA O NOME DA INTERFACE.    
+ SELECT    
+  @NMITF = TBCTRL_NMINTERFACE    
+ FROM   
+  TBH1ITFAGECTRL2   
+ WHERE   
+  TBCTRL_NRCTRL = @NRCTRL_IN  
+  
+ -- SELECIONA A THREAD DE EXECUCAO DA INTERFACE      
+ SELECT       
+  @THREAD = ISNULL(TBITFCFG_THREADEXEC,1)      
+ FROM      
+  TBH1_ITF_CNF2    
+ WHERE       
+  TBITF_NMINTERFACE = @NMITF  
+  
+ -- SELECIONA A DATA E HORA ATUAL  
+ SET @DATA_ATUAL = GETDATE()  
+   
+ -- CASO NAO TENHA ENCONTRADO A INTERFACE      
+ IF @@ROWCOUNT = 0      
+ BEGIN      
+  SELECT      
+   @STA_OUT = 9999,      
+   @MSGSTA_OUT = @NMSP + '9999 - INTERFACE ' + @NMITF + ' NAO ENCONTRADA'      
+  
+  GOTO LBL_ERRO      
+ END      
+   
+ --===============================================================  
+ -- CRIA TABELA TEMPORARIA PAPEL  
+ --===============================================================  
+   
+ IF object_id('tempdb..#papel') is not null DROP TABLE #papel  
+ SELECT  
+   TBPAP_CDPAP = pap.TBPAP_CDPAP  
+  ,TBFDO_CDFDO = pap.TBFDO_CDFDO  
+  ,TBFDO_SGFDO = fdo.TBFDO_SGFDO  
+  ,TBFDO_NMFDO = fdo.TBFDO_NMFDO  
+  ,TBFDO_CDCNPJ = fdo.TBFDO_CDCNPJ  
+  ,CDSACoriginal = pap.TBPAP_CDSAC  
+  ,TBPAP_CDSAC =  case   
+       when tcot.TBCTCOT_CD = 1 then isnull(pap.TBPAP_CDSAC, '')  
+       else case   
+         when isnull(pap.TBPAP_CDSAC,'') <> '' then isnull(pap.TBPAP_CDSAC,'')  
+         else                   isnull(classe_preferida.TBPAP_CDSAC, '')  
+         end  
+       end  
+  ,TBTCOT_CDTPCOT = pap.TBTCOT_CDTPCOT  
+  ,SGTPCOToriginal= tcot.TBTCOT_SGTPCOT  
+  ,TBTCOT_SGTPCOT =  case   
+       when tcot.TBCTCOT_CD = 1 then isnull(tcot.TBTCOT_SGTPCOT, '')  
+       else case   
+         when isnull(pap.TBPAP_CDSAC,'') <> '' then isnull(classe_integralizada.TBTCOT_SGTPCOT, isnull(tcot.TBTCOT_SGTPCOT, ''))  
+         else                                       isnull(classe_preferida.TBTCOT_SGTPCOT, classe_integralizada.TBTCOT_SGTPCOT)  
+         end  
+       end  
+  ,TBPAP_CDFY = PAP.TBPAP_CDFY  
+ INTO #papel  
+ FROM  
+  TBH1PAP2              pap (nolock)  
+  inner join TBH1TCOT2 tcot (nolock) on tcot.TBTCOT_CDTPCOT = pap.TBTCOT_CDTPCOT and tcot.TBCTCOT_CD in (1, 4) --somente COTA e COMP  
+  inner join TBH1FDO2   fdo (nolock) on  fdo.TBFDO_CDFDO    = pap.TBFDO_CDFDO  
+  left  join (  
+      select   
+       TBFDO_CDFDO = p.TBFDO_CDFDO  
+      ,TBTCOT_SGTPCOT = c.TBTCOT_SGTPCOT  
+      ,TBPAP_CDSAC = isnull(p.TBPAP_CDSAC,'')  
+      ,preferencia = row_number() over( partition by p.TBFDO_CDFDO   
+                order by case   
+                   when c.TBTCOT_SGTPCOT like '%uni%'  then '1' + c.TBTCOT_SGTPCOT  
+                   when c.TBTCOT_SGTPCOT like '%cota%' then '2' + c.TBTCOT_SGTPCOT  
+                   else                                     '3' + c.TBTCOT_SGTPCOT  
+                   end  
+               )  
+      from TBH1PAP2 p(nolock) inner join TBH1TCOT2 c(nolock) on c.TBTCOT_CDTPCOT = p.TBTCOT_CDTPCOT and c.TBCTCOT_CD = 1  
+      where isnull(p.TBPAP_CDSAC,'') <> '' --and isnull(p.TBPAP_QTEMI,0) <> 0  
+  )classe_preferida on classe_preferida.TBFDO_CDFDO = pap.TBFDO_CDFDO and classe_preferida.preferencia = 1  
+  left  join (  
+      select   
+       TBFDO_CDFDO = p.TBFDO_CDFDO  
+      ,TBTCOT_SGTPCOT = c.TBTCOT_SGTPCOT  
+      ,TBPAP_CDSAC = isnull(p.TBPAP_CDSAC,'')  
+      ,preferencia = row_number() over( partition by p.TBFDO_CDFDO, isnull(p.TBPAP_CDSAC ,'')  
+                order by case   
+                   when c.TBTCOT_SGTPCOT like '%uni%'  then '1' + c.TBTCOT_SGTPCOT  
+                   when c.TBTCOT_SGTPCOT like '%cota%' then '2' + c.TBTCOT_SGTPCOT  
+                   else                                     '3' + c.TBTCOT_SGTPCOT  
+                   end  
+               )  
+      from TBH1PAP2 p(nolock) inner join TBH1TCOT2 c(nolock) on c.TBTCOT_CDTPCOT = p.TBTCOT_CDTPCOT and c.TBCTCOT_CD = 1  
+      --where isnull(p.TBPAP_CDSAC,'') <> '' --and isnull(p.TBPAP_QTEMI,0) <> 0  
+  )classe_integralizada on classe_integralizada.TBFDO_CDFDO = pap.TBFDO_CDFDO and classe_integralizada.TBPAP_CDSAC = isnull(pap.TBPAP_CDSAC, '') and classe_integralizada.preferencia = 1  
+  
+  
+  
+  
+  ---------------cria tabela com informacao de cotas e participacao  
+   IF OBJECT_ID('TEMPDB..#INFOCOTAPART') IS NOT NULL DROP TABLE #INFOCOTAPART  
+   SELECT *,PARTFORMATADA = CAST(0 AS DECIMAL (18,5)),SOMAPART= CAST(0 AS DECIMAL (18,5)) INTO #INFOCOTAPART FROM (SELECT   
+    PAP.TBPAP_CDSAC SAC,  
+    PAP.TBPAP_CDPAP CDPAP,  
+    FDO.TBFDO_CDFDO CDFDO,      
+    INV.TBINV_CDINV CDINV,  
+    QUANTIDADECOTAS   = CONVERT(NUMERIC(24, 12), ISNULL(EST.TBESTC_QTATU, 0))  
+    ,TOTALCLASSECOTA   = CONVERT(NUMERIC(24, 12), ISNULL(TOTAL.QTATU, 0))  
+    ,PARTICIPACAO      =   
+         CONVERT(NUMERIC(24, 12), 100 * ISNULL(EST.TBESTC_QTATU,0)   
+         /   
+         CASE WHEN ISNULL(TOTAL.QTATU,0) <> 0   
+         THEN  
+          ISNULL(TOTAL.QTATU,0)   
+         ELSE   
+          1        
+         END   
+      
+    )  
+   FROM   
+    (   
+     SELECT  
+       P.TBFDO_CDFDO  
+      ,P.TBPAP_CDSAC  
+      ,I.TBINV_CDINV  
+      ,  TBESTC_QTATU   = SUM(ISNULL(E.TBESTC_QTATU,0))  
+      ,  TBTCOT_SGTPCOT = MIN(P.TBTCOT_SGTPCOT)  
+      ,  TBPAP_CDPAP    = MIN(P.TBPAP_CDPAP)  
+      ,  TBPAP_CDFY     = MIN(P.TBPAP_CDFY)  
+  
+     FROM TBH1ESTC2 E (NOLOCK)  
+     INNER JOIN #PAPEL P (NOLOCK) ON P.TBPAP_CDPAP = E.TBPAP_CDPAP  
+     INNER JOIN TBH1INV2 I (NOLOCK) ON I.TBINV_CDINV = E.TBINV_CDINV AND I.TBTINV_CDTPINV IN (1, 5, 6)  
+     WHERE E.TBESTC_DT = @DTREF_IN  
+       AND E.TBESTC_DT = @DTREF_IN  
+       AND E.TBESTC_QTATU <> 0  
+     GROUP BY P.TBFDO_CDFDO, P.TBPAP_CDSAC, I.TBINV_CDINV  
+    ) EST  
+    INNER JOIN TBH1INV2  INV (NOLOCK) ON INV.TBINV_CDINV = EST.TBINV_CDINV AND INV.TBTINV_CDTPINV IN (1, 5, 6)  
+    INNER JOIN #PAPEL  PAP (NOLOCK) ON PAP.TBPAP_CDPAP = EST.TBPAP_CDPAP  
+    ---------  
+    INNER JOIN (  
+       SELECT  
+         CDFDO = P.TBFDO_CDFDO  
+        ,CDSAC = P.TBPAP_CDSAC  
+        ,QTATU = SUM(ISNULL(E.TBESTC_QTATU,0))  
+       FROM TBH1ESTC2 E (NOLOCK)  
+       INNER JOIN #PAPEL P (NOLOCK) ON P.TBPAP_CDPAP = E.TBPAP_CDPAP  
+       INNER JOIN TBH1INV2 I (NOLOCK) ON I.TBINV_CDINV = E.TBINV_CDINV AND I.TBTINV_CDTPINV IN (1, 5, 6)  
+       WHERE E.TBESTC_DT = @DTREF_IN  
+       GROUP BY P.TBFDO_CDFDO, P.TBPAP_CDSAC  
+       ) TOTAL ON TOTAL.CDFDO = EST.TBFDO_CDFDO AND TOTAL.CDSAC = EST.TBPAP_CDSAC  
+      INNER JOIN TBH1FDO2  FDO (NOLOCK) ON FDO.TBFDO_CDFDO = PAP.TBFDO_CDFDO  
+    ) X   
+  
+--atualiza tabela com a participacao formatada  
+  UPDATE T   
+  SET T.PARTFORMATADA =   
+   CASE WHEN CAST((T.PARTICIPACAO) AS DECIMAL (18,5)) = 0.00000 THEN 0.00001 ELSE   
+      CAST((T2.PARTICIPACAO) AS DECIMAL (18,5))  END   
+  FROM #INFOCOTAPART T  
+  INNER JOIN #INFOCOTAPART T2 ON T.CDFDO = T2.CDFDO AND T.CDINV = T2.CDINV AND T.SAC = T2.SAC  
+  
+  
+  IF OBJECT_ID('TEMPDB..#MAIORINV') IS NOT NULL DROP TABLE #MAIORINV  
+  SELECT   
+   CDFDO  
+   ,SAC  
+   ,CDINV  
+   ,MAIOR =ROW_NUMBER() OVER (PARTITION BY CDFDO,SAC ORDER BY PARTICIPACAO DESC,CDINV DESC)  
+   ,PARTICIPACAO MAIORPART  
+  INTO #MAIORINV  
+  FROM   
+   #INFOCOTAPART  
+  
+  IF OBJECT_ID('TEMPDB..#INFOFINAL') IS NOT NULL DROP TABLE #INFOFINAL  
+  SELECT   
+   CDFDO  
+   ,SAC  
+   ,SUM(PARTFORMATADA) PARTFORMATADASOMADA  
+   ,(SUM(PARTFORMATADA) - 100.00000)*-1 VALOR_DIFERENCA_SOMAR   
+  INTO   
+   #INFOFINAL   
+  FROM   
+   #INFOCOTAPART  
+  GROUP BY CDFDO,SAC  
+  
+  UPDATE  T  
+  SET   
+   PARTFORMATADA = PARTFORMATADA + FINAIS.VALOR_DIFERENCA_SOMAR  
+  FROM   
+   #INFOCOTAPART T  
+  INNER JOIN  
+   (  
+    SELECT   
+     FDOFINAL  = MAIOR.CDFDO,  
+     INVFINAL = MAIOR.CDINV,  
+     VALOR_DIFERENCA_SOMAR,  
+     MAIOR.SAC SAC   
+    FROM   
+     #MAIORINV MAIOR   
+    INNER JOIN #INFOFINAL  FINAL ON FINAL.CDFDO  = MAIOR.CDFDO AND FINAL.SAC= MAIOR.SAC  
+    WHERE   
+     MAIOR = 1  
+   ) FINAIS ON FINAIS.FDOFINAL = T.CDFDO AND FINAIS.INVFINAL = T.CDINV and T.SAC = FINAIS.SAC  
+  
+  
+ --===============================================================  
+ -- CRIAÇÃO DA ARQUIVO TEMP  
+ --===============================================================  
+  
+ IF OBJECT_ID('tempdb..#ARQUIVO') IS NOT NULL DROP TABLE #ARQUIVO  
+   
+ CREATE TABLE #ARQUIVO (  
+  Dados      CHAR(150)  NOT NULL,  
+  TipoRegistro    CHAR(2)   NULL,  
+  NomeArquivo     CHAR(20)  NULL,  
+  Origem      CHAR(3)   NULL,  
+  DataReferencia    CHAR(8)   NULL,  
+  DataPosicao     CHAR(8)   NULL,  
+  DataHoraGeracaoArquivo  CHAR(14)  NULL,  
+  DataCompetencia    CHAR(8)   NULL,  
+  CpfCnpjFundoCarteira  CHAR(15)  NULL,  
+  CodigoFundoPassivo   CHAR(10)  NULL,  
+  CodigoFundoAtivo   CHAR(15)  NULL,  
+  EmpresaInvestidor   CHAR(3)   NULL,  
+  BancoInvestidor    CHAR(3)   NULL,  
+  AgenciaInvestidor   CHAR(4)   NULL,  
+  ContaInvestidor    CHAR(9)   NULL,  
+  DacContaInvestidor   CHAR(1)   NULL,  
+  PosicaoQtdeCotasInvestidor CHAR(16)  NULL,  
+  PosicaoFinanceiraInvestidor CHAR(16)  NULL,  
+  ParticipacaoInvestidor  CHAR(16)  NULL,  
+  TotalRegistros    INT    NULL,  
+  -------------------------------------------------  
+  AuxTipoRegistro    TINYINT   NULL,  
+  AuxNomeArquivo    CHAR(20)  NULL,  
+  AuxOrigem     CHAR(3)   NULL,  
+  AuxDataReferencia   DATETIME  NULL,  
+  AuxDataCompetencia   DATETIME  NULL,  
+  AuxCpfCnpjFundoCarteira  NUMERIC(15, 0) NULL,  
+  AuxCodigoFundoPassivo  VARCHAR(5)  NULL,  
+  AuxCodigoFundoAtivo   VARCHAR(15)  NULL,  
+  AuxEmpresaInvestidor  VARCHAR(3)  NULL,  
+  AuxBancoInvestidor   VARCHAR(6)  NULL,  
+  AuxAgenciaInvestidor  VARCHAR(4)  NULL,  
+  AuxContaInvestidor   VARCHAR(7)  NULL,  
+  AuxDacContaInvestidor  VARCHAR(1)  NULL,  
+  AuxPosQtdeCotasInvestidor NUMERIC(24, 12) NULL,  
+  AuxPosFinanceiraInvestidor NUMERIC(24, 12) NULL,  
+  AuxParticipacaoInvestidor NUMERIC(24, 12) NULL,  
+  -------------------------------------------------  
+  AdministradorCodigo   SMALLINT  NULL,  
+  AdministradorSigla   VARCHAR(15)  NULL,  
+  FundoCodigo     INT    NULL,  
+  FundoSigla     VARCHAR(15)  NULL,  
+  ClasseCota     VARCHAR(15)  NULL,  
+  PapelCodigo     INT    NULL,  
+  InvestidorCodigo   INT    NULL,  
+  InvestidorCPFCNPJ   NUMERIC(15, 0) NULL  
+ )  
+   
+ --===============================================================  
+ -- HEADER  
+ --===============================================================  
+  
+ INSERT INTO #ARQUIVO  
+ (  
+  Dados, TipoRegistro, NomeArquivo, Origem, DataReferencia, DataHoraGeracaoArquivo, DataPosicao,  
+  -----------------------------------------------------------------------------------------------  
+  AuxTipoRegistro, AuxNomeArquivo, AuxOrigem, AuxDataReferencia  
+ )  
+ SELECT  
+  Dados = (TipoRegistro + NomeArquivo + Origem + DataReferencia + DataHoraGeracaoArquivo + DataPosicao + Reserva),  
+  TipoRegistro,   
+  NomeArquivo,   
+  Origem,   
+  DataReferencia,   
+  DataHoraGeracaoArquivo,   
+  DataPosicao,  
+  ------------------------------------  
+  AuxTipoRegistro,  
+  AuxNomeArquivo,  
+  AuxOrigem,  
+  AuxDataReferencia  
+ FROM   
+ (  
+  SELECT  
+   TipoRegistro   = '00',  
+   NomeArquivo    = 'H1 _COTISTA_' + CONVERT(CHAR(8), @DTREF_IN, 112),  
+   Origem     = 'H1 ',  
+   DataReferencia   = CONVERT(CHAR(8), @DTREF_IN, 112),  
+   DataHoraGeracaoArquivo = CONVERT(VARCHAR(10), @DATA_ATUAL, 112) + REPLACE(CONVERT(VARCHAR(10), @DATA_ATUAL, 108), ':', ''),  
+   DataPosicao    = CONVERT(CHAR(8), @DTREF_IN, 112),  
+   Reserva     = REPLICATE(' ', 95),  
+   -----------------------------------------------------------------------------------------------------------  
+   AuxTipoRegistro   = 0,  
+   AuxNomeArquivo   = 'H1 _COTISTA_' + CONVERT(CHAR(8), @DTREF_IN, 112),  
+   AuxOrigem    = 'H1',  
+   AuxDataReferencia  = @DTREF_IN  
+ ) #  
+  
+ --===============================================================  
+ -- DETAIL   
+ --===============================================================  
+  
+ INSERT INTO #ARQUIVO  
+ (  
+  Dados, TipoRegistro, CpfCnpjFundoCarteira, CodigoFundoPassivo, CodigoFundoAtivo, EmpresaInvestidor, BancoInvestidor, AgenciaInvestidor, ContaInvestidor,  
+  DacContaInvestidor, PosicaoQtdeCotasInvestidor, PosicaoFinanceiraInvestidor, ParticipacaoInvestidor,  
+  -----------------------------------------------------------------------------------------------------------------------------------------------------  
+  AuxTipoRegistro, AuxCpfCnpjFundoCarteira, AuxCodigoFundoPassivo, AuxCodigoFundoAtivo, AuxEmpresaInvestidor, AuxBancoInvestidor, AuxAgenciaInvestidor, AuxContaInvestidor,   
+  AuxDacContaInvestidor, AuxPosQtdeCotasInvestidor, AuxParticipacaoInvestidor,  
+  -----------------------------------------------------------------------------------------------------------------------------------------------------  
+  DataCompetencia, AdministradorCodigo, AdministradorSigla, FundoCodigo, FundoSigla, ClasseCota, PapelCodigo, InvestidorCodigo, InvestidorCPFCNPJ  
+ )  
+ SELECT   
+  Dados = (TipoRegistro + CpfCnpjFundoCarteira + CodigoFundoPassivo + CodigoFundoAtivo +   
+     EmpresaInvestidor + BancoInvestidor + AgenciaInvestidor + ContaInvestidor + DacContaInvestidor +   
+     PosicaoQtdeCotasInvestidor + PosicaoFinanceiraInvestidor + ParticipacaoInvestidor + Notas),  
+  TipoRegistro,   
+  CpfCnpjFundoCarteira,   
+  CodigoFundoPassivo,   
+  CodigoFundoAtivo,   
+  EmpresaInvestidor,  
+  BancoInvestidor,   
+  AgenciaInvestidor,   
+  ContaInvestidor,  
+  DacContaInvestidor,   
+  PosicaoQtdeCotasInvestidor,   
+  PosicaoFinanceiraInvestidor,  
+  ParticipacaoInvestidor,  
+  -----------------------------  
+  AuxTipoRegistro,  
+  AuxCpfCnpjFundoCarteira,  
+  AuxCodigoFundoPassivo,  
+  AuxCodigoFundoAtivo,  
+  AuxEmpresaInvestidor,  
+  AuxBancoInvestidor,  
+  AuxAgenciaInvestidor,  
+  AuxContaInvestidor,  
+  AuxDacContaInvestidor,  
+  AuxPosQtdeCotasInvestidor,  
+  AuxParticipacaoInvestidor,  
+  -----------------------------  
+  DataCompetencia,  
+  AdministradorCodigo,   
+  AdministradorSigla,   
+  FundoCodigo,   
+  FundoSigla,   
+  ClasseCota,   
+  PapelCodigo,   
+  InvestidorCodigo,  
+  InvestidorCPFCNPJ  
+ FROM   
+ (   
+  SELECT   
+   TipoRegistro     = '01',  
+   CpfCnpjFundoCarteira   = CASE WHEN consulta.FundoCNPJ IS NOT NULL  
+             THEN REPLICATE('0', (15 - LEN(consulta.FundoCNPJ))) + LTRIM(RTRIM(CAST(consulta.FundoCNPJ AS VARCHAR(15))))  
+             ELSE REPLICATE(' ', 15) END,  
+   CodigoFundoPassivo    = UPPER(LTRIM(RTRIM(ISNULL(consulta.FundoCodigo, ''))) + REPLICATE(' ', (10 - LEN(ISNULL(consulta.FundoCodigo, ''))))),  
+   CodigoFundoAtivo    = UPPER(LTRIM(RTRIM(ISNULL(consulta.SiglaSAC, ''))) + REPLICATE(' ', (15 - LEN(ISNULL(consulta.SiglaSAC, ''))))),  
+   EmpresaInvestidor    = CASE WHEN consulta.InvestidorContaVirtual_empresa IS NOT NULL  
+             THEN REPLICATE('0', (3 - LEN(ISNULL(consulta.InvestidorContaVirtual_empresa, '')))) + LTRIM(RTRIM(ISNULL(consulta.InvestidorContaVirtual_empresa, '')))  
+             ELSE REPLICATE('0', 3) END,  
+   BancoInvestidor     = CASE WHEN consulta.InvestidorContaVirtual_banco IS NOT NULL  
+             THEN REPLICATE('0', (3 - LEN(ISNULL(consulta.InvestidorContaVirtual_banco, '')))) + LTRIM(RTRIM(ISNULL(consulta.InvestidorContaVirtual_banco, '')))  
+             ELSE REPLICATE('0', 3) END,  
+   AgenciaInvestidor    = CASE WHEN consulta.InvestidorContaVirtual_agencia IS NOT NULL  
+             THEN REPLICATE('0', 4 - LEN(consulta.InvestidorContaVirtual_agencia)) + LTRIM(RTRIM(consulta.InvestidorContaVirtual_agencia))  
+             ELSE REPLICATE('0', 4) END,  
+   ContaInvestidor     = CASE WHEN consulta.InvestidorContaVirtual_conta IS NOT NULL  
+             THEN REPLICATE('0', 9 - LEN(consulta.InvestidorContaVirtual_conta)) + LTRIM(RTRIM(consulta.InvestidorContaVirtual_conta))  
+             ELSE REPLICATE('0', 9) END,  
+   DacContaInvestidor    = CASE WHEN consulta.InvestidorContaVirtual_dac IS NOT NULL AND LEN(consulta.InvestidorContaVirtual_dac) = 1   
+             THEN LTRIM(RTRIM(consulta.InvestidorContaVirtual_dac))  
+             ELSE REPLICATE('0', 1) END,  
+   PosicaoQtdeCotasInvestidor  = CASE WHEN ISNULL(consulta.QuantidadeCotas, 0) <> 0   
+             THEN CASE WHEN LEN(CAST(FLOOR(consulta.QuantidadeCotas) AS VARCHAR(12))) > 11 THEN REPLICATE('9', 16)   
+              ELSE REPLICATE('0', 11 - LEN(FLOOR(consulta.QuantidadeCotas))) + LTRIM(RTRIM(FLOOR(consulta.QuantidadeCotas)))  
+              + LTRIM(RTRIM(LEFT(PARSENAME(consulta.QuantidadeCotas, 1), 5))) + REPLICATE('0', 5 - LEN(LEFT(PARSENAME(consulta.QuantidadeCotas, 1), 5))) END  
+             ELSE REPLICATE(' ', 16) END,  
+   PosicaoFinanceiraInvestidor  = REPLICATE(' ', 16),  
+   ParticipacaoInvestidor   = CASE WHEN ISNULL(consulta.QuantidadeCotas, 0) <> 0   
+             THEN REPLICATE('0', 3 - LEN(FLOOR(consulta.Participacao))) + LTRIM(RTRIM(FLOOR(consulta.Participacao)))  
+              + LTRIM(RTRIM((LEFT(PARSENAME(consulta.Participacao, 1), 5)))) + REPLICATE('0', 5 - LEN(LEFT(PARSENAME(consulta.Participacao, 1), 5)))  
+             ELSE REPLICATE(' ', 8) END,  
+   Notas       = REPLICATE(' ', 48),  
+   -----------------------------------------------------------------------------------------------------------  
+   AuxTipoRegistro     = 1,  
+   AuxCpfCnpjFundoCarteira   = consulta.FundoCNPJ,  
+   AuxCodigoFundoPassivo   = consulta.CodigoFY,  
+   AuxCodigoFundoAtivo    = consulta.SiglaSAC,  
+   AuxEmpresaInvestidor   = consulta.InvestidorContaVirtual_empresa,  
+   AuxBancoInvestidor    = consulta.InvestidorContaVirtual_banco,  
+   AuxAgenciaInvestidor   = consulta.InvestidorContaVirtual_agencia,  
+   AuxContaInvestidor    = consulta.InvestidorContaVirtual_conta,  
+   AuxDacContaInvestidor   = consulta.InvestidorContaVirtual_dac,  
+   AuxPosQtdeCotasInvestidor  = consulta.QuantidadeCotas,  
+   AuxParticipacaoInvestidor  = consulta.Participacao,  
+   -----------------------------------------------------------------------------------------------------------  
+   DataCompetencia     = CONVERT(CHAR(8), consulta.DataCompetencia, 112),  
+   AdministradorCodigo    = consulta.AdministradorCodigo,  
+   AdministradorSigla    = consulta.AdministradorSigla,  
+   FundoCodigo      = consulta.FundoCodigo,   
+   FundoSigla      = consulta.FundoSigla,   
+   ClasseCota       = consulta.ClasseCota,  
+   PapelCodigo      = consulta.PapelCodigo,   
+   InvestidorCodigo    = consulta.InvestidorCodigo,  
+   InvestidorCPFCNPJ    = consulta.InvestidorCPFCNPJ  
+  FROM   
+  (  
+   SELECT  
+     DataCompetencia     = @DTREF_IN  
+     --------------------------  
+    ,AdministradorCodigo = adm.TBADM_CDADM  
+    ,AdministradorSigla  = adm.TBADM_SGADM  
+    ,AdministradorCNPJ   = adm.TBADM_CDCPFCNPJ   
+     --------------------------  
+    ,FundoCodigo = pap.TBFDO_CDFDO  
+    ,FundoSigla  = pap.TBFDO_SGFDO  
+    ,FundoCNPJ   = pap.TBFDO_CDCNPJ  
+    ,ClasseCota  = PAP.TBTCOT_SGTPCOT  
+    ,SiglaSAC    = pap.TBPAP_CDSAC  
+    ,PapelCodigo = pap.TBPAP_CDPAP  
+    ,CodigoFY  = pap.TBPAP_CDFY  
+     --------------------------  
+    ,InvestidorCodigo  = inv.TBINV_CDINV  
+    ,InvestidorNome    = inv.TBINV_NMINV  
+    ,InvestidorTipo    = case inv.TBTPS_CDTPPESSOA when 1 then 'PF' when 2 then 'PJ' else '' end  
+    ,InvestidorCPFCNPJ = inv.TBINV_CDCPFCNPJ  
+     --------------------------  
+    ,InvestidorContaVirtual = right(   '0000'+ltrim(rtrim(isnull(ruc.TBPARINV_CDAGERUC,   '0000'))),4) + '-'  
+          + right('0000000'+ltrim(rtrim(isnull(ruc.TBPARINV_CDCTARUC,'0000000'))),7) + '-'  
+          + right( '0'+ltrim(rtrim(isnull(ruc.TBPARINV_CDDACRUC,      '0'))),1)  
+    ,InvestidorContaVirtual_empresa = ruc.TBPARINV_CDEMPRUC  
+    ,InvestidorContaVirtual_banco = ruc.TBPARINV_CDBCORUC  
+    ,InvestidorContaVirtual_agencia = ruc.TBPARINV_CDAGERUC  
+    ,InvestidorContaVirtual_conta   = ruc.TBPARINV_CDCTARUC  
+    ,InvestidorContaVirtual_dac     = ruc.TBPARINV_CDDACRUC  
+     --------------------------  
+    ,CustodiaDaPosicao = case inv.TBTINV_CDTPINV when 1 then 'ITAU' when 5 then 'BOLSA' when 6 then 'CETIP' else '' end  
+    ,QuantidadeCotas   = convert(numeric(24, 12), isnull(INFO_COT_PART.QUANTIDADECOTAS, 0))  
+    ,TotalClasseCota   = convert(numeric(24, 12), isnull(INFO_COT_PART.TOTALCLASSECOTA, 0))  
+    ,Participacao      = INFO_COT_PART.PARTFORMATADA  
+   FROM   
+    (   
+     select * FROM #INFOCOTAPART   
+     )INFO_COT_PART  
+    INNER JOIN TBH1INV2 INV (NOLOCK) ON INV.TBINV_CDINV = INFO_COT_PART.CDINV  
+    INNER JOIN #PAPEL PAP (NOLOCK) ON PAP.TBPAP_CDPAP = INFO_COT_PART.CDPAP      
+     left join TBH1PARINV2 ruc (nolock) on ruc.TBINV_CDINV = INFO_COT_PART.CDINV  
+     left join (select TBFDO_CDFDO, TBADM_CDADM  
+       ,rowNumber = row_number() over(partition by TBFDO_CDFDO order by TBADMFDO_DTVIG desc)  
+       from TBH1ADMFDO2 (nolock)  
+       where TBADMFDO_DTVIG <= @DTREF_IN  
+       )vigente on vigente.TBFDO_CDFDO = INFO_COT_PART.CDFDO AND vigente.rowNumber = 1  
+     left join TBH1ADM2 adm (nolock) on adm.TBADM_CDADM = vigente.TBADM_CDADM  
+  )  
+  AS consulta  
+ ) #  
+ ORDER BY  
+  #.FundoCodigo ASC,  
+  #.CodigoFundoAtivo ASC,  
+  #.InvestidorCodigo ASC  
+  
+ --===============================================================  
+ -- CONTAGEM DOS REGISTROS  
+ --===============================================================  
+  
+ SELECT @TOTREGDET = @@ROWCOUNT  
+  
+ --===============================================================  
+ -- TRAILER  
+ --===============================================================  
+  
+ INSERT INTO #ARQUIVO  
+ (  
+  Dados, TipoRegistro, NomeArquivo, Origem, DataReferencia, DataHoraGeracaoArquivo, DataPosicao, TotalRegistros,  
+   ---------------------------------------------------------------------------------------------------------------------------------  
+  AuxTipoRegistro, AuxNomeArquivo, AuxOrigem, AuxDataReferencia  
+ )  
+ SELECT   
+  Dados = (TipoRegistro + NomeArquivo + Origem + DataReferencia + DataHoraGeracaoArquivo + DataPosicao + TotalRegistros + Reserva),  
+  TipoRegistro,   
+  NomeArquivo,   
+  Origem,   
+  DataReferencia,   
+  DataHoraGeracaoArquivo,   
+  DataPosicao,   
+  TotalRegistros,  
+  ------------------------------------  
+  AuxTipoRegistro,  
+  AuxNomeArquivo,  
+  AuxOrigem,  
+  AuxDataReferencia  
+ FROM   
+ (   
+  SELECT   
+   TipoRegistro   = '99',  
+   NomeArquivo    = 'H1 _COTISTA_' + CONVERT(CHAR(8), @DTREF_IN, 112),  
+   Origem     = 'H1 ',  
+   DataReferencia   = CONVERT(CHAR(8), @DTREF_IN, 112),  
+   DataHoraGeracaoArquivo = CONVERT(VARCHAR(10), @DATA_ATUAL, 112) + REPLACE(CONVERT(VARCHAR(10), @DATA_ATUAL, 108), ':', ''),  
+   DataPosicao    = CONVERT(CHAR(8), @DTREF_IN, 112),  
+   TotalRegistros   = RIGHT(REPLICATE('0', 9) + LTRIM(RTRIM(CONVERT(VARCHAR(9), (@TOTREGDET + 2)))), 9),  
+   Reserva     = REPLICATE(' ', 86),  
+   -----------------------------------------------------------------------------------------------------------  
+   AuxTipoRegistro   = 99,  
+   AuxNomeArquivo   = 'H1 _COTISTA_' + CONVERT(CHAR(8), @DTREF_IN, 112),  
+   AuxOrigem    = 'H1',  
+   AuxDataReferencia  = @DTREF_IN  
+ ) #  
+  
+ --===============================================================  
+ -- EXCLUI REGISTROS NA POSINV MENOR QUE 60 DIAS CORRIDOS  
+ --===============================================================  
+  
+ SELECT @DATA_EXGO = CONVERT(DATE, DATEADD(DAY, -60, GETDATE()))  
+  
+ --===============================================================  
+ -- EXCLUI REGISTROS NA POSINV PARA A DATA REFERENCIA  
+ --===============================================================  
+  
+ DELETE POSINV  
+ FROM TBH1_ISS_POSINV2 POSINV  
+ WHERE   
+  POSINV.TBISS_DTMOV = @DTREF_IN  
+  OR POSINV.TBISS_DTGER < @DATA_EXGO  
+  
+ --===============================================================  
+ -- INSERE REGISTROS NA POSINV2  
+ --===============================================================  
+   
+ INSERT INTO TBH1_ISS_POSINV2  
+ (  
+  TBISS_NRCTRL,  
+  TBISS_DTMOV,  
+  TBISS_DTGER,  
+  -------------------------------------------------  
+  TBISS_TPREG,  
+  TBISS_NMARQ,  
+  TBISS_CDORIGEM,  
+  TBISS_TOTREG,  
+  TBISS_DADOS,  
+  -------------------------------------------------  
+  TBISS_FDOCDCNPJ,  
+  TBISS_PAPCDFY,  
+  TBISS_PAPCDSAC,  
+  TBISS_PARINVCDEMPRUC,  
+  TBISS_PARINVCDBCORUC,  
+  TBISS_PARINVCDAGERUC,  
+  TBISS_PARINVCDCTARUC,  
+  TBISS_PARINVCDDACRUC,  
+  TBISS_ESTCQTATU,  
+  TBISS_VLRPERINV,  
+  -------------------------------------------------  
+  TBISS_ADMCDADM,  
+  TBISS_ADMSGADM,  
+  TBISS_FDOCDFDO,  
+  TBISS_FDOSGFDO,  
+  TBISS_TCOTSGTPCOT,  
+  TBISS_PAPCDPAP,  
+  TBISS_INVCDINV,  
+  -------------------------------------------------  
+  TBISS_DTINC,  
+  TBUSR_CDUSRINC  
+ )  
+ SELECT  
+  @NRCTRL_IN,  
+  @DTREF_IN,  
+  @DTSIS,  
+  ------------------------------  
+  RES.AuxTipoRegistro,  
+  RES.AuxNomeArquivo,  
+  RES.AuxOrigem,  
+  RES.TotalRegistros,  
+  RES.Dados,  
+  ------------------------------  
+  RES.AuxCpfCnpjFundoCarteira,  
+  RES.AuxCodigoFundoPassivo,  
+  RES.AuxCodigoFundoAtivo,  
+  RES.AuxEmpresaInvestidor,  
+  RES.AuxBancoInvestidor,  
+  RES.AuxAgenciaInvestidor,  
+  RES.AuxContaInvestidor,  
+  RES.AuxDacContaInvestidor,  
+  RES.AuxPosQtdeCotasInvestidor,  
+  RES.AuxParticipacaoInvestidor,  
+  ------------------------------  
+  RES.AdministradorCodigo,  
+  RES.AdministradorSigla,  
+  RES.FundoCodigo,  
+  RES.FundoSigla,  
+  RES.ClasseCota,  
+  RES.PapelCodigo,  
+  RES.InvestidorCodigo,  
+  ------------------------------  
+  GETDATE(),  
+  @CDUSR_IN  
+ FROM   
+ (  
+  SELECT  
+   LINHA = ROW_NUMBER() OVER (ORDER BY A.AuxTipoRegistro ASC,   
+            A.AdministradorCodigo ASC,  
+            A.FundoCodigo ASC,   
+            A.CodigoFundoAtivo ASC,   
+            A.AgenciaInvestidor ASC,  
+            A.ContaInvestidor ASC,  
+            A.InvestidorCodigo ASC),  
+   *  
+  FROM #ARQUIVO AS A  
+ ) AS RES  
+ ORDER BY RES.LINHA  
+  
+ --===============================================================  
+ -- INSERE NA TABELA DADOS DA INTERFACE      
+ --===============================================================  
+  
+ SET @SQL = @SQL + ' INSERT INTO TBH1ITFDADOS' + CONVERT(VARCHAR, @THREAD) +'2 ' + CHAR(13)      
+ SET @SQL = @SQL + ' (TBITF_NMINTERFACE, TBITF_NRCTRL, TBITF_DTGER, TBITF_DTMOV, TBITF_TPREG, TBITF_DADOS) ' + CHAR(13)      
+ SET @SQL = @SQL + ' SELECT ''' + @NMITF + ''', TBISS_NRCTRL, TBISS_DTGER, TBISS_DTMOV, TBISS_TPREG, TBISS_DADOS ' + CHAR(13)      
+ SET @SQL = @SQL + ' FROM TBH1_ISS_POSINV2 ' + CHAR(13)   
+ SET @SQL = @SQL + ' WHERE TBISS_NRCTRL = ' + CONVERT(VARCHAR(30), @NRCTRL_IN)  
+ SET @SQL = @SQL + ' ORDER BY TBISS_CD ASC'  
+  
+ EXEC sp_executesql @SQL  
+       
+ LBL_OK:      
+  RETURN 0      
+       
+ LBL_ERRO:      
+  RETURN 1      
+        
+END  
+       
